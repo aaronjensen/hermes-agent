@@ -302,3 +302,86 @@ def test_plugin_page_does_not_use_cdp_frames_or_redirect_frame_writes():
     assert out["success"] is False
     supervisor.assert_not_called()
     page_backend.return_value.evaluate.assert_not_called()
+
+
+SHOPIFY = "https://checkout.pci.shopifyinc.com"
+
+
+@pytest.mark.parametrize("frame_origin, ancestors, page_origin, qualifies", [
+    (SHOPIFY, [PAGE], PAGE, True),
+    (SHOPIFY, ["https://other.test"], PAGE, False),
+    (SHOPIFY, ["https://ads.test", PAGE], PAGE, False),
+    (SHOPIFY, [], PAGE, False),
+    (SHOPIFY, [PAGE], "https://other.test", False),
+    ("https://checkout.pci.shopifyinc.com.evil.test", [PAGE], PAGE, False),
+    ("https://fields.checkout.pci.shopifyinc.com", [PAGE], PAGE, False),
+    ("http://checkout.pci.shopifyinc.com", [PAGE], PAGE, False),
+    ("https://checkout.pci.shopifyinc.com:444", [PAGE], PAGE, False),
+])
+def test_shopify_split_fields_require_exact_origin_and_direct_parent(
+    store, frame_origin, ancestors, page_origin, qualifies,
+):
+    # Synthetic standard-autocomplete controls; real Shopify markup has not been captured.
+    tokens = {"number": "cc-number", "name": "cc-name", "expiry": "cc-exp", "cvc": "cc-csc"}
+    controls = {fid: [{"autocomplete": token, "index": 0, "type": "text"}]
+                for fid, token in tokens.items()}
+    frames = [{"frame_id": fid, "url": f"{frame_origin}/{fid}"} for fid in controls]
+    sup = _FakeSupervisor(frames, {})
+    meta = store.add_item(kind="payment", label="Visa", origin=PAGE, secret=_CARD)
+    writes = []
+
+    def frame_eval(expression, frame_id=None):
+        result = ({"origin": frame_origin, "ancestors": ancestors}
+                  if expression == vault._FRAME_CONTEXT_JS else controls[frame_id])
+        return {"ok": True, "result": json.dumps(result)}
+
+    def write(task_id, expression, frame_id=None):
+        writes.append((frame_id, expression))
+        return {"success": True, "result": json.dumps({"filled": 1})}
+
+    with patch("agent.vault_store.get_vault_store", return_value=store), \
+         patch.object(vault, "_page_backend", return_value=None), \
+         patch.object(vault, "_ensure_supervisor", return_value=sup), \
+         patch.object(sup, "evaluate_runtime", side_effect=frame_eval), \
+         patch.object(vault, "_focus_bound_origin", return_value=page_origin), \
+         patch.object(vault, "_eval_js", return_value={"success": True, "result": "[]"}), \
+         patch.object(vault, "_eval_js_secret", side_effect=write), \
+         patch("tools.approval_prompt.request_elicitation_consent", return_value="accept"):
+        raw = vault.browser_vault_fill(meta.id)
+
+    out = json.loads(raw)
+    assert out["success"] is qualifies
+    assert _CARD["card_number"] not in raw and _CARD["cvc"] not in raw
+    if qualifies:
+        assert out["filled_fields"] == 4
+        assert out["fields"] == sorted(tokens.values())
+        assert out["frames"] == [SHOPIFY]
+        assert [fid for fid, _ in writes] == list(tokens)
+        for fid, expression in writes:
+            assert f'"token": "{tokens[fid]}"' in expression
+            if fid != "number":
+                assert _CARD["card_number"] not in expression
+    else:
+        assert writes == []
+
+
+@pytest.mark.parametrize("frame_origin, ancestors", [
+    ("https://evil.test", [PAGE]),
+    (SHOPIFY, ["https://other.test"]),
+    (SHOPIFY, ["https://ads.test", PAGE]),
+    (SHOPIFY, []),
+])
+def test_shopify_write_rechecks_origin_and_ancestry_before_touching_dom(frame_origin, ancestors):
+    selected = [{"index": 0, "token": "cc-number", "value": "dummy-card"}]
+    expression, frame_id, bound = vault._fill_writes(
+        [], [("shopify", SHOPIFY, "frame-nonce", selected)], PAGE, "page-nonce",
+    )[0]
+    assert frame_id == "shopify" and bound == SHOPIFY
+    script = (
+        "const location = " + json.dumps({"origin": frame_origin, "ancestorOrigins": ancestors}) + ";\n"
+        "const window = {location};\n"
+        "const document = {querySelectorAll: () => {throw Error('DOM was touched');}};\n"
+        "console.log(" + expression + ");\n"
+    )
+    result = subprocess.run(["node"], input=script, text=True, capture_output=True, check=True, timeout=30)
+    assert json.loads(result.stdout)["refused"] == "origin_changed"

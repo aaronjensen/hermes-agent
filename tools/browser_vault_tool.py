@@ -217,6 +217,7 @@ PAYMENT_FRAME_ORIGINS = frozenset({
     "https://assets.braintreegateway.com",
     "https://checkoutshopper-live.adyen.com",
     "https://checkoutshopper-test.adyen.com",
+    "https://checkout.pci.shopifyinc.com",
 })
 
 _PAYMENT_FRAME_SELECTOR = ", ".join(f'iframe[src^="{o}/"]' for o in sorted(PAYMENT_FRAME_ORIGINS))
